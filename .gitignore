@@ -1,0 +1,16 @@
+# Fingerprint captures and images derived from them (personal biometric data)
+dataset*/
+match_out/
+frame*.bin
+*.bin.blob
+*.bin.json
+*.pgm
+*.png
+
+# Logs and debug traces
+*.log
+fprintd_stack.txt
+
+# Build output
+__pycache__/
+libfprint-rts5812/crypto/test_decode

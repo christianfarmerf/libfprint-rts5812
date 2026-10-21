@@ -1,0 +1,40 @@
+diff --git a/libfprint/meson.build b/libfprint/meson.build
+index f11533c..27fe62b 100644
+--- a/libfprint/meson.build
++++ b/libfprint/meson.build
+@@ -120,6 +120,7 @@ driver_sources = {
+     'egis_etu905' : files('drivers/egismoc/egis_etu905.c'),
+     'vfs0050' : files('drivers/vfs0050.c'),
+     'elan' : files('drivers/elan.c'),
++    'rts5812' : files('drivers/rts5812.c', 'drivers/rts5812_match.c', 'drivers/crypto/rts5812_crypto.c'),
+     'elanmoc' : files('drivers/elanmoc/elanmoc.c'),
+     'elanspi' : files('drivers/elanspi.c'),
+     'nb1010' : files('drivers/nb1010.c'),
+@@ -215,6 +216,7 @@ deps = [
+     gmodule_dep,
+     gobject_dep,
+     gusb_dep,
++    nettle_dep,
+     mathlib_dep,
+ ] + optional_deps
+ 
+diff --git a/meson.build b/meson.build
+index ab09dc1..03a28e6 100644
+--- a/meson.build
++++ b/meson.build
+@@ -97,6 +97,7 @@ gio_dep = dependency('gio-unix-2.0', version: '>=' + glib_min_version)
+ gobject_dep = dependency('gobject-2.0', version: '>=' + glib_min_version)
+ gmodule_dep = dependency('gmodule-2.0', version: '>=' + glib_min_version)
+ gusb_dep = dependency('gusb', version: '>= 0.2.0')
++nettle_dep = dependency('nettle', version: '>= 3.6')  # rts5812 frame crypto
+ mathlib_dep = cc.find_library('m', required: false)
+ 
+ # The following dependencies are only used for tests
+@@ -144,6 +145,7 @@ drivers_info = {
+     'nb1010': {},
+     'fpcmoc': {},
+     'realtek': {},
++    'rts5812': {},
+     'focaltech_moc': {},
+     'mafpmoc': {},
+     'secugen': {},

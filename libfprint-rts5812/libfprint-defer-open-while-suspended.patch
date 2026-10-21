@@ -1,0 +1,190 @@
+diff --git a/libfprint/fp-device-private.h b/libfprint/fp-device-private.h
+index 1c3702f..8466d43 100644
+--- a/libfprint/fp-device-private.h
++++ b/libfprint/fp-device-private.h
+@@ -90,6 +90,9 @@ typedef struct
+   /* Suspend/resume tasks */
+   GTask  *suspend_resume_task;
+   GError *suspend_error;
++  GTask  *pending_open_task;   /* open requested while suspended; runs on resume */
++  /* set by fp-device.c, called from fpi_device_resume_complete() */
++  GSourceFunc run_pending_open;
+ 
+   /* Device temperature model information and state */
+   GSource      *temp_timeout;
+diff --git a/libfprint/fp-device.c b/libfprint/fp-device.c
+index 115063d..de1c9f4 100644
+--- a/libfprint/fp-device.c
++++ b/libfprint/fp-device.c
+@@ -224,6 +224,10 @@ fp_device_finalize (GObject *object)
+ 
+   g_clear_pointer (&priv->temp_timeout, g_source_destroy);
+ 
++  if (priv->pending_open_task)
++    g_task_return_error (g_steal_pointer (&priv->pending_open_task),
++                         fpi_device_error_new (FP_DEVICE_ERROR_REMOVED));
++
+   g_clear_slist (&priv->sources, (GDestroyNotify) g_source_destroy);
+ 
+   g_clear_pointer (&priv->current_idle_cancel_source, g_source_destroy);
+@@ -805,6 +809,10 @@ fp_device_has_storage (FpDevice *device)
+   return !!(priv->features & FP_DEVICE_FEATURE_STORAGE);
+ }
+ 
++static void fpi_device_open_start (FpDevice *device,
++                                   GTask    *task_in);
++static gboolean fp_device_run_pending_open (gpointer user_data);
++
+ /**
+  * fp_device_open:
+  * @device: a #FpDevice
+@@ -824,7 +832,6 @@ fp_device_open (FpDevice           *device,
+ {
+   g_autoptr(GTask) task = NULL;
+   FpDevicePrivate *priv = fp_device_get_instance_private (device);
+-  GError *error = NULL;
+ 
+   task = g_task_new (device, cancellable, callback, user_data);
+   if (g_task_return_error_if_cancelled (task))
+@@ -837,6 +844,17 @@ fp_device_open (FpDevice           *device,
+       return;
+     }
+ 
++  /* An open that races system suspend (e.g. the lock screen claiming the
++   * reader as the lid closes) would otherwise fail with BUSY, and the lock
++   * screen does not retry after resume. Park it and run it on resume. */
++  if (priv->is_suspended && !priv->current_task && !priv->pending_open_task)
++    {
++      g_debug ("Device is suspended, deferring open until resume");
++      priv->pending_open_task = g_steal_pointer (&task);
++      priv->run_pending_open = fp_device_run_pending_open;
++      return;
++    }
++
+   if (priv->current_task || priv->is_suspended)
+     {
+       g_task_return_error (task,
+@@ -844,6 +862,46 @@ fp_device_open (FpDevice           *device,
+       return;
+     }
+ 
++  fpi_device_open_start (device, g_steal_pointer (&task));
++}
++
++/* Start an open that fp_device_open() parked while the device was suspended;
++ * scheduled (as an idle) by fpi_device_resume_complete(). */
++static gboolean
++fp_device_run_pending_open (gpointer user_data)
++{
++  FpDevice *device = user_data;
++  FpDevicePrivate *priv = fp_device_get_instance_private (device);
++  GTask *task = g_steal_pointer (&priv->pending_open_task);
++
++  if (!task)
++    return G_SOURCE_REMOVE;
++
++  g_debug ("Running open deferred during suspend");
++  if (priv->current_task || priv->is_suspended || priv->is_open)
++    {
++      g_task_return_error (task, fpi_device_error_new (FP_DEVICE_ERROR_BUSY));
++      g_object_unref (task);
++    }
++  else
++    {
++      fpi_device_open_start (device, task);   /* takes ownership */
++    }
++
++  return G_SOURCE_REMOVE;
++}
++
++static void
++fpi_device_open_start (FpDevice *device,
++                       GTask    *task_in)
++{
++  g_autoptr(GTask) task = task_in;
++  FpDevicePrivate *priv = fp_device_get_instance_private (device);
++  GError *error = NULL;
++
++  if (g_task_return_error_if_cancelled (task))
++    return;
++
+   switch (priv->type)
+     {
+     case FP_DEVICE_TYPE_USB:
+diff --git a/libfprint/fpi-device.c b/libfprint/fpi-device.c
+index 9500b3a..23a9513 100644
+--- a/libfprint/fpi-device.c
++++ b/libfprint/fpi-device.c
+@@ -2013,6 +2013,10 @@ fpi_device_resume_complete (FpDevice *device,
+     g_task_return_error (task, error);
+   else
+     g_task_return_boolean (task, TRUE);
++
++  if (priv->pending_open_task && priv->run_pending_open)
++    g_idle_add_full (G_PRIORITY_DEFAULT, priv->run_pending_open,
++                     g_object_ref (device), g_object_unref);
+ }
+ 
+ /**
+diff --git a/tests/test-fpi-device.c b/tests/test-fpi-device.c
+index 165532d..a71b005 100644
+--- a/tests/test-fpi-device.c
++++ b/tests/test-fpi-device.c
+@@ -2834,6 +2834,49 @@ test_driver_identify_suspend_while_idle (void)
+   g_assert_no_error (error);
+ }
+ 
++static void
++open_while_suspended_cb (GObject *device, GAsyncResult *res, gpointer user_data)
++{
++  GError **error = user_data;
++  gboolean ok = fp_device_open_finish (FP_DEVICE (device), res, error);
++
++  g_assert_true (ok || *error);
++  g_object_set_data (device, "open-done", GINT_TO_POINTER (TRUE));
++}
++
++static void
++test_driver_open_while_suspended (void)
++{
++  g_autoptr(FpAutoResetClass) dev_class = auto_reset_device_class ();
++  g_autoptr(FpAutoCloseDevice) device = NULL;
++  g_autoptr(GError) error = NULL;
++  FpiDeviceFake *fake_dev;
++
++  device = g_object_new (FPI_TYPE_DEVICE_FAKE, NULL);
++  fake_dev = FPI_DEVICE_FAKE (device);
++
++  fp_device_suspend (device, NULL, (GAsyncReadyCallback) fp_device_suspend_finish, &error);
++  while (g_main_context_iteration (NULL, FALSE))
++    continue;
++  g_assert_no_error (error);
++
++  /* An open while suspended is parked, not failed with BUSY ... */
++  fp_device_open (device, NULL, open_while_suspended_cb, &error);
++  while (g_main_context_iteration (NULL, FALSE))
++    continue;
++  g_assert_null (g_object_get_data (G_OBJECT (device), "open-done"));
++  g_assert (fake_dev->last_called_function == NULL);
++  g_assert_false (fp_device_is_open (device));
++
++  /* ... and runs once the device resumes. */
++  fp_device_resume (device, NULL, (GAsyncReadyCallback) fp_device_resume_finish, NULL);
++  while (!g_object_get_data (G_OBJECT (device), "open-done"))
++    g_main_context_iteration (NULL, TRUE);
++  g_assert_no_error (error);
++  g_assert (fake_dev->last_called_function == dev_class->open);
++  g_assert_true (fp_device_is_open (device));
++}
++
+ static void
+ test_driver_identify_warmup_cooldown (void)
+ {
+@@ -4155,6 +4198,7 @@ main (int argc, char *argv[])
+   g_test_add_func ("/driver/identify/suspend_succeeds", test_driver_identify_suspend_succeeds);
+   g_test_add_func ("/driver/identify/suspend_busy_error", test_driver_identify_suspend_busy_error);
+   g_test_add_func ("/driver/identify/suspend_while_idle", test_driver_identify_suspend_while_idle);
++  g_test_add_func ("/driver/open/while_suspended", test_driver_open_while_suspended);
+ 
+   g_test_add_func ("/driver/identify/warmup_cooldown", test_driver_identify_warmup_cooldown);
+ 
