@@ -1,0 +1,8 @@
+{
+  "uuid": "fingerprint-wake@rea.local",
+  "name": "Fingerprint Wake",
+  "description": "Keep fingerprint authentication running on the lock screen's clock view and blanked screen, and wake the display when a finger is scanned. Lets a fingerprint unlock the session without pressing a key first.",
+  "shell-version": ["50"],
+  "session-modes": ["user", "unlock-dialog"],
+  "version": 1
+}
